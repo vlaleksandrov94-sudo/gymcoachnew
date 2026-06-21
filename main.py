@@ -141,37 +141,66 @@ def save_state(state):
 
 
 def _group_record(state, uid, group):
-    """Вернуть (и при необходимости создать) запись группы вида
-    {"phase": int, "history": [ {date, feeling, notes}, ... ] }.
-    Совместимо со старым форматом, где значение было просто числом фазы."""
+    """Запись группы: {"pos": int (0..6 позиция в мезоцикле), "history": [...]}.
+    Совместимо со старым форматом (int = номер фазы, либо ключ 'phase')."""
     uid = str(uid)
     state.setdefault(uid, {})
     rec = state[uid].get(group)
     if rec is None:
-        rec = {"phase": 0, "history": []}
+        rec = {"pos": 0, "history": []}
         state[uid][group] = rec
-    elif isinstance(rec, int):  # миграция со старого формата
-        rec = {"phase": rec, "history": []}
+    elif isinstance(rec, int):  # совсем старый формат: просто число фазы
+        rec = {"pos": rec % 3, "history": []}
         state[uid][group] = rec
-    rec.setdefault("phase", 0)
+    # миграция с промежуточного формата, где было поле 'phase'
+    if "pos" not in rec:
+        rec["pos"] = rec.get("phase", 0) % 3
     rec.setdefault("history", [])
     return rec
 
 
+# Мезоцикл из 7 позиций: два круга (вход→объём→сила) + разгрузка.
+# Индекс позиции -> индекс «типа» фазы (0=вход,1=объём,2=сила,3=разгрузка)
+CYCLE_LEN = 7
+_POS_TO_PHASE = [0, 1, 2, 0, 1, 2, 3]
+
+
 def get_phase(user_id, group):
-    """Текущая фаза (0,1,2) пользователя для конкретной группы."""
+    """Тип текущей фазы: 0=вход, 1=объём, 2=сила, 3=разгрузка."""
     state = load_state()
     rec = _group_record(state, user_id, group)
-    return rec["phase"] % 3
+    return _POS_TO_PHASE[rec["pos"] % CYCLE_LEN]
+
+
+def get_cycle_pos(user_id, group):
+    state = load_state()
+    rec = _group_record(state, user_id, group)
+    return rec["pos"] % CYCLE_LEN
+
+
+def is_reassessment(user_id, group):
+    """True, если СЕЙЧАС начало нового большого цикла (позиция 0 после разгрузки),
+    т.е. пора предложить поднять рабочие веса. Срабатывает после прохождения разгрузки."""
+    return get_cycle_pos(user_id, group) == 0 and _was_after_deload(user_id, group)
+
+
+def _was_after_deload(user_id, group):
+    state = load_state()
+    rec = _group_record(state, user_id, group)
+    return bool(rec.get("after_deload"))
 
 
 def advance_phase(user_id, group):
-    """Продвинуть фазу группы на +1 (по кругу из 3)."""
+    """Сдвинуть позицию мезоцикла на +1. Возвращает (новая_позиция, новый_тип_фазы)."""
     state = load_state()
     rec = _group_record(state, user_id, group)
-    rec["phase"] = (rec["phase"] + 1) % 3
+    old_pos = rec["pos"] % CYCLE_LEN
+    new_pos = (rec["pos"] + 1) % CYCLE_LEN
+    rec["pos"] = new_pos
+    # отметка: только что завершили разгрузку (позиция 6) и встали на 0
+    rec["after_deload"] = (old_pos == 6 and new_pos == 0)
     save_state(state)
-    return rec["phase"]
+    return new_pos, _POS_TO_PHASE[new_pos]
 
 
 def add_history(user_id, group, feeling=None, notes=None):
@@ -297,13 +326,65 @@ def profile_text(user_id):
 
 
 # ---------------------------------------------------------------------------
+#  Подготовительный этап (круговые тренировки на всё тело)
+#  Длительность зависит от стажа из профиля; по умолчанию 5.
+# ---------------------------------------------------------------------------
+PREP_TARGET_DEFAULT = 5
+PREP_TARGET_BY_EXP = {"novice": 6, "inter": 4, "adv": 2}
+
+
+def prep_target(user_id):
+    """Сколько круговых тренировок нужно пройти на старте (решает 'тренер')."""
+    p = get_profile(user_id)
+    return PREP_TARGET_BY_EXP.get(p.get("exp"), PREP_TARGET_DEFAULT)
+
+
+def prep_done(user_id):
+    state = load_state()
+    return state.get(str(user_id), {}).get("_prep_done", 0)
+
+
+def prep_active(user_id):
+    """True, если атлет ещё в подготовительном этапе (круговые)."""
+    return prep_done(user_id) < prep_target(user_id)
+
+
+def advance_prep(user_id):
+    """+1 к счётчику пройденных круговых. Возвращает (done, target, just_finished)."""
+    state = load_state()
+    uid = str(user_id)
+    state.setdefault(uid, {})
+    done = state[uid].get("_prep_done", 0) + 1
+    state[uid]["_prep_done"] = done
+    save_state(state)
+    target = prep_target(user_id)
+    return done, target, done >= target
+
+
+# ---------------------------------------------------------------------------
 #  Названия фаз
 # ---------------------------------------------------------------------------
 PHASE_NAMES = [
-    "🟢 Неделя 1 — Мягкий вход (адаптация)",
-    "🟡 Неделя 2 — Объём (гипертрофия)",
-    "🔴 Неделя 3 — Сила (тяжёлый вес)",
+    "🟢 Мягкий вход (адаптация)",
+    "🟡 Объём (гипертрофия)",
+    "🔴 Сила (тяжёлый вес)",
+    "🌙 Разгрузка (восстановление)",
 ]
+
+# Базовая круговая тренировка на всё тело для подготовительного этапа.
+CIRCUIT_WORKOUT = (
+    "*Круговая тренировка (всё тело) — подготовительный этап*\n\n"
+    "Цель сейчас — связки, сердце, техника. Работаем по кругу, вес умеренный.\n\n"
+    "Сделай *3–4 круга*, между упражнениями отдых 15–30 сек, между кругами 1.5–2 мин:\n\n"
+    "1️⃣ Приседания (с собственным весом или лёгкой гирей) — 15\n"
+    "2️⃣ Отжимания от пола (можно с колен) — 12\n"
+    "3️⃣ Тяга гантели/блока к поясу — 12 на каждую руку\n"
+    "4️⃣ Выпады на месте — 10 на каждую ногу\n"
+    "5️⃣ Жим гантелей сидя (лёгкие) — 12\n"
+    "6️⃣ Планка — 30–40 сек\n"
+    "7️⃣ Скручивания на пресс — 15–20\n\n"
+    "_Темп ровный, без отказа. Задача — войти в форму, а не убиться._"
+)
 
 WARMUP = (
     "🔥 *Разминка (перед каждой тренировкой)*\n"
@@ -467,9 +548,25 @@ def workout_keyboard(group):
 
 
 def build_workout_message(user_id, group):
+    # Подготовительный этап — всегда круговая на всё тело
+    if prep_active(user_id):
+        done = prep_done(user_id)
+        target = prep_target(user_id)
+        header = (f"🔄 *Подготовительный этап* — тренировка {done + 1} из {target}\n"
+                  "━━━━━━━━━━━━━━━━━━━━\n\n")
+        return WARMUP + header + CIRCUIT_WORKOUT
+
     phase = get_phase(user_id, group)
     data = WORKOUTS[group]
     header = f"*{data['title']}*\n{PHASE_NAMES[phase]}\n━━━━━━━━━━━━━━━━━━━━\n\n"
+    if phase == 3:
+        # Разгрузка: берём силовую базу, но помечаем как лёгкую неделю.
+        body = (
+            "🌙 *Разгрузочная неделя.* Веса 60–70% от рабочих, на 2 повтора меньше, "
+            "минус 1 подход в каждом упражнении. Цель — восстановиться, не убиваться.\n\n"
+            "За основу — обычная силовая, но облегчённая:\n\n" + data["phases"][2]
+        )
+        return WARMUP + header + body
     return WARMUP + header + data["phases"][phase]
 
 
@@ -705,11 +802,18 @@ async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def progress_text(user_id):
-    lines = ["📊 *Твой прогресс по группам:*\n"]
+    lines = ["📊 *Твой прогресс*\n"]
+    if prep_active(user_id):
+        lines.append(
+            f"🔄 Подготовительный этап: {prep_done(user_id)}/{prep_target(user_id)} круговых\n"
+            "(после него откроется силовой сплит)\n"
+        )
+    lines.append("*По группам:*")
     for g, data in WORKOUTS.items():
         phase = get_phase(user_id, g)
+        pos = get_cycle_pos(user_id, g)
         lines.append(f"\n{data['title']}")
-        lines.append(f"  Фаза: {PHASE_NAMES[phase]}")
+        lines.append(f"  Фаза: {PHASE_NAMES[phase]} (шаг {pos+1}/{CYCLE_LEN})")
         hist = get_history(user_id, g)
         if hist:
             last = hist[-1]
@@ -862,7 +966,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("feel:"):
         _, group, feel_code = data.split(":", 2)
         feeling = FEELING_MAP.get(feel_code, feel_code)
-        phase = get_phase(uid, group)
+        in_prep = prep_active(uid)
+        if in_prep:
+            phase_label = f"🔄 Подготовительный этап ({prep_done(uid)+1}/{prep_target(uid)})"
+        else:
+            phase_label = PHASE_NAMES[get_phase(uid, group)]
         base = build_workout_message(uid, group)
         if _claude_client is None:
             # Нет ключа Claude — выдаём базовую
@@ -871,14 +979,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         await query.edit_message_text("🤖 Подбираю тренировку под твоё самочувствие…")
-        hist = history_text(uid, group)
+        hist = history_text(uid, "_circuit" if in_prep else group)
         equip = equipment_text(uid)
         prof = profile_text(uid)
-        adapted = await adapt_with_claude(base, feeling, PHASE_NAMES[phase], hist, equip, prof)
+        adapted = await adapt_with_claude(base, feeling, phase_label, hist, equip, prof)
         if adapted:
-            title = WORKOUTS[group]["title"]
+            title = "🔄 Круговая (всё тело)" if in_prep else WORKOUTS[group]["title"]
             text = (
-                f"*{title}* · {PHASE_NAMES[phase]}\n"
+                f"*{title}* · {phase_label}\n"
                 f"🤖 _Адаптировано под самочувствие_\n"
                 "━━━━━━━━━━━━━━━━━━━━\n\n" + adapted
             )
@@ -915,14 +1023,43 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("rate:"):
         _, group, rate_code = data.split(":", 2)
         feeling = RATING_MAP.get(rate_code, rate_code)
-        add_history(uid, group, feeling=feeling)
-        new_phase = advance_phase(uid, group)
-        title = WORKOUTS[group]["title"]
-        # запоминаем, какую группу можно дополнить весами текстом
         context.user_data["awaiting_notes_group"] = group
+
+        # Подготовительный этап: двигаем счётчик круговых, а не мезоцикл
+        if prep_active(uid):
+            add_history(uid, "_circuit", feeling=feeling)
+            done, target, finished = advance_prep(uid)
+            if finished:
+                await query.edit_message_text(
+                    f"✅ Круговая {done}/{target} засчитана!\n\n"
+                    "🎉 *Подготовительный этап пройден!* Связки и техника готовы — "
+                    "перехожу на силовой сплит с периодизацией.\n\n"
+                    "Теперь пиши группу мышц (грудь / спина / ноги) — и я дам "
+                    "целевую тренировку под фазу. 👇",
+                    reply_markup=main_keyboard(), parse_mode="Markdown",
+                )
+            else:
+                await query.edit_message_text(
+                    f"✅ Круговая {done}/{target} засчитана!\n\n"
+                    f"Ещё {target - done} подготовительных — и переходим к силовому сплиту. "
+                    "Можешь дописать веса текстом. Возвращайся за следующей 👇",
+                    reply_markup=main_keyboard(), parse_mode="Markdown",
+                )
+            return
+
+        # Обычный мезоцикл
+        add_history(uid, group, feeling=feeling)
+        new_pos, new_phase = advance_phase(uid, group)
+        title = WORKOUTS[group]["title"]
+        extra = ""
+        if new_phase == 3:
+            extra = "\n\n🌙 Дальше — *разгрузочная неделя*: восстановимся перед новым витком."
+        elif is_reassessment(uid, group):
+            extra = ("\n\n📈 *Новый цикл!* Разгрузка позади — на следующих тренировках "
+                     "пробуй поднять рабочие веса на шаг вверх. Окрепли — пора прибавлять.")
         await query.edit_message_text(
             f"✅ Записал! {title} — {feeling}.\n"
-            f"Следующий раз будет: *{PHASE_NAMES[new_phase]}*\n\n"
+            f"Следующий раз будет: *{PHASE_NAMES[new_phase]}*{extra}\n\n"
             "Можешь прислать рабочие веса текстом — учту в следующий раз. "
             "Или просто возвращайся за новой тренировкой 👇",
             reply_markup=main_keyboard(),
