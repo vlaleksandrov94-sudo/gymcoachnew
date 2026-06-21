@@ -642,8 +642,22 @@ SYSTEM_PROMPT = (
     "- Учитывай стаж: новичку — проще движения, акцент на технику и меньше объёма; опытному — можно "
     "сложнее и интенсивнее.\n"
     "- Учитывай частоту в неделю при выборе объёма за тренировку (реже тренируется — можно чуть больше за раз).\n\n"
-    "Формат: пиши по-русски, тем же компактным форматом с эмодзи-нумерацией, как в исходнике. "
-    "В начале 1-2 строки: что изменил, как прогрессируешь нагрузку и почему. Кратко и конкретно."
+    "Разнообразие:\n"
+    "- Не копируй прошлую тренировку из истории один-в-один: меняй порядок или часть упражнений "
+    "на равноценные в рамках доступного оборудования и текущей фазы. Атлет не должен видеть одно и то же.\n\n"
+    "ФОРМАТ ОТВЕТА (строго соблюдай, пиши по-русски, компактно — это читают с телефона в зале):\n"
+    "1) Первая строка — заголовок группы и фаза.\n"
+    "2) Блок «🎯 Логика дня:» — 1–3 коротких предложения: почему сегодня именно эта фаза, "
+    "как она работает на цель атлета, и общий замысел тренировки.\n"
+    "3) Список упражнений с эмодзи-нумерацией. Для КАЖДОГО упражнения в одной компактной строке:\n"
+    "   • название, подходы×повторы и рекомендуемый вес;\n"
+    "   • в скобках коротко — целевая мышца и зачем (например: «верх груди, базовое»);\n"
+    "   • пометка оборудования: «✓ есть» если снаряд точно в списке зала, либо «🔄 замена: <вместо чего>» "
+    "если ты подобрал аналог из-за отсутствия снаряда.\n"
+    "   ВАЖНО: если оборудование НЕ задано (список пуст/общий), не пиши «✓ есть» и «🔄 замена» — "
+    "вместо этого одной строкой вверху попроси атлета настроить зал командой /зал, чтобы пометки заработали.\n"
+    "4) Блок «⚖️ По весам:» — 1–2 строки: откуда взяты цифры (из истории, прогрессия, % от рабочего на разгрузке).\n"
+    "Будь конкретным и без воды. Не раздувай текст — пояснения короткие, по сути."
 )
 
 
@@ -662,7 +676,7 @@ async def adapt_with_claude(base_workout, feeling, phase_name, hist_text, equip_
     try:
         resp = await _claude_client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=1500,
+            max_tokens=2000,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": user_msg}],
         )
@@ -940,6 +954,47 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def send_long(query, context, text, reply_markup):
+    """Показать длинный текст: первая часть в текущем сообщении, остаток — отдельными.
+    Клавиатура крепится к последнему сообщению. Telegram лимит ~4096 символов."""
+    LIMIT = 3800
+    # Разбиваем по абзацам, чтобы не рвать посреди строки
+    chunks = []
+    cur = ""
+    for para in text.split("\n\n"):
+        piece = (para + "\n\n")
+        if len(cur) + len(piece) > LIMIT and cur:
+            chunks.append(cur.rstrip())
+            cur = piece
+        else:
+            cur += piece
+    if cur.strip():
+        chunks.append(cur.rstrip())
+    if not chunks:
+        chunks = [text[:LIMIT]]
+
+    async def _send(target_edit, body, markup):
+        try:
+            if target_edit:
+                await query.edit_message_text(body, reply_markup=markup, parse_mode="Markdown")
+            else:
+                await context.bot.send_message(
+                    chat_id=query.message.chat_id, text=body,
+                    reply_markup=markup, parse_mode="Markdown")
+        except Exception:
+            # запасной путь без Markdown (на случай проблемной разметки)
+            if target_edit:
+                await query.edit_message_text(body, reply_markup=markup)
+            else:
+                await context.bot.send_message(
+                    chat_id=query.message.chat_id, text=body, reply_markup=markup)
+
+    for i, chunk in enumerate(chunks):
+        first = (i == 0)
+        last = (i == len(chunks) - 1)
+        await _send(first, chunk, reply_markup if last else None)
+
+
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -990,18 +1045,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"🤖 _Адаптировано под самочувствие_\n"
                 "━━━━━━━━━━━━━━━━━━━━\n\n" + adapted
             )
-            # Телеграм не любит сообщения >4096 символов
-            if len(text) > 4000:
-                text = text[:3990] + "…"
-            try:
-                await query.edit_message_text(
-                    text, reply_markup=workout_keyboard(group), parse_mode="Markdown"
-                )
-            except Exception:
-                # На случай проблем с Markdown — без разметки
-                await query.edit_message_text(
-                    text, reply_markup=workout_keyboard(group)
-                )
+            await send_long(query, context, text, workout_keyboard(group))
         else:
             await query.edit_message_text(
                 base + "\n\n_(умную адаптацию сделать не удалось — вот базовая)_",
