@@ -1,2 +1,4 @@
 python-telegram-bot>=22
 anthropic>=0.40
+psycopg[binary]>=3.2
+psycopg-pool>=3.2

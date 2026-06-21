@@ -56,20 +56,86 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-#  Простое хранилище прогресса (файл рядом со скриптом)
+#  Хранилище состояния.
+#  Если задан DATABASE_URL (Railway Postgres) — храним в БД (данные не теряются
+#  при передеплоях). Иначе — в локальном JSON-файле (удобно для запуска на компе).
+#  Снаружи всё работает через load_state()/save_state(), как раньше, поэтому
+#  остальной код менять не нужно.
 # ---------------------------------------------------------------------------
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "progress.json")
+DATABASE_URL = os.environ.get("DATABASE_URL")
+_db_pool = None  # ленивая инициализация
+
+# Кэш состояния в памяти, чтобы не дёргать БД на каждый чих.
+_state_cache = None
+
+
+def _db_connect():
+    """Создаёт пул соединений к Postgres (psycopg3). Возвращает пул или None."""
+    global _db_pool
+    if not DATABASE_URL:
+        return None
+    if _db_pool is not None:
+        return _db_pool
+    try:
+        from psycopg_pool import ConnectionPool
+        # Railway даёт URL вида postgres://...; psycopg ждёт postgresql://
+        url = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+        _db_pool = ConnectionPool(url, min_size=1, max_size=3, kwargs={"autocommit": True})
+        with _db_pool.connection() as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS bot_state ("
+                "id INT PRIMARY KEY DEFAULT 1, data JSONB NOT NULL, "
+                "CONSTRAINT single_row CHECK (id = 1))"
+            )
+        logger.info("Хранилище: PostgreSQL (данные сохраняются между деплоями).")
+        return _db_pool
+    except Exception as e:
+        logger.error("Не удалось подключиться к БД (%s). Откат на файл.", e)
+        _db_pool = None
+        return None
 
 
 def load_state():
+    """Загрузить всё состояние (dict). Источник: БД или файл."""
+    global _state_cache
+    if _state_cache is not None:
+        return _state_cache
+    pool = _db_connect()
+    if pool is not None:
+        try:
+            with pool.connection() as conn:
+                row = conn.execute("SELECT data FROM bot_state WHERE id = 1").fetchone()
+                _state_cache = (row[0] if row else {}) or {}
+                return _state_cache
+        except Exception as e:
+            logger.error("Ошибка чтения из БД (%s). Пробую файл.", e)
+    # файловый режим
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            _state_cache = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
-        return {}
+        _state_cache = {}
+    return _state_cache
 
 
 def save_state(state):
+    """Сохранить всё состояние. Назначение: БД или файл."""
+    global _state_cache
+    _state_cache = state
+    pool = _db_connect()
+    if pool is not None:
+        try:
+            with pool.connection() as conn:
+                conn.execute(
+                    "INSERT INTO bot_state (id, data) VALUES (1, %s) "
+                    "ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data",
+                    (json.dumps(state, ensure_ascii=False),),
+                )
+            return
+        except Exception as e:
+            logger.error("Ошибка записи в БД (%s). Пишу в файл.", e)
+    # файловый режим
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
