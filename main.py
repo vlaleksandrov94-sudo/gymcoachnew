@@ -239,6 +239,64 @@ def equipment_text(user_id):
 
 
 # ---------------------------------------------------------------------------
+#  Профиль атлета (цель, стаж, частота) — один на пользователя
+# ---------------------------------------------------------------------------
+GOAL_MAP = {
+    "mass": "набор мышечной массы",
+    "strength": "развитие силы",
+    "cut": "сушка / рельеф (снижение жира с сохранением мышц)",
+    "endurance": "выносливость / общая физуха",
+    "maintain": "поддержание формы",
+}
+EXP_MAP = {
+    "novice": "новичок (меньше года)",
+    "inter": "средний уровень (1–3 года стажа)",
+    "adv": "опытный (3+ лет стажа)",
+}
+FREQ_MAP = {
+    "2": "2 тренировки в неделю",
+    "3": "3 тренировки в неделю",
+    "4": "4 тренировки в неделю",
+    "5": "5+ тренировок в неделю",
+}
+
+
+def get_profile(user_id):
+    """Профиль атлета (dict) или {}."""
+    state = load_state()
+    return state.get(str(user_id), {}).get("_profile", {})
+
+
+def set_profile_field(user_id, field, value):
+    state = load_state()
+    uid = str(user_id)
+    state.setdefault(uid, {})
+    state[uid].setdefault("_profile", {})
+    state[uid]["_profile"][field] = value
+    save_state(state)
+
+
+def profile_complete(user_id):
+    p = get_profile(user_id)
+    return all(k in p for k in ("goal", "exp", "freq"))
+
+
+def profile_text(user_id):
+    """Человекочитаемый профиль для передачи в Claude."""
+    p = get_profile(user_id)
+    if not p:
+        return "Профиль атлета не заполнен (цель, стаж и частота неизвестны)."
+    parts = []
+    if p.get("goal"):
+        parts.append(f"цель — {GOAL_MAP.get(p['goal'], p['goal'])}")
+    if p.get("exp"):
+        parts.append(f"уровень — {EXP_MAP.get(p['exp'], p['exp'])}")
+    if p.get("freq"):
+        parts.append(f"частота — {FREQ_MAP.get(p['freq'], p['freq'])}")
+    return "; ".join(parts) if parts else "Профиль атлета не заполнен."
+
+
+# ---------------------------------------------------------------------------
 #  Названия фаз
 # ---------------------------------------------------------------------------
 PHASE_NAMES = [
@@ -480,21 +538,29 @@ SYSTEM_PROMPT = (
     "- Если в базовой тренировке есть упражнение на тренажёр/снаряд, которого нет — замени его "
     "равноценным аналогом на доступном оборудовании, сохранив целевую мышцу и характер нагрузки.\n"
     "- Не предлагай упражнения, требующие отсутствующего оборудования.\n\n"
+    "Профиль атлета (цель, стаж, частота):\n"
+    "- Подстраивай тренировку под цель: масса — умеренные веса и больше объёма (8–12 повт), "
+    "сила — тяжелее и меньше повторов (3–6), сушка/рельеф — выше плотность, суперсеты, чуть больше повторов, "
+    "выносливость — многоповторка и короткий отдых, поддержание — сбалансированно.\n"
+    "- Учитывай стаж: новичку — проще движения, акцент на технику и меньше объёма; опытному — можно "
+    "сложнее и интенсивнее.\n"
+    "- Учитывай частоту в неделю при выборе объёма за тренировку (реже тренируется — можно чуть больше за раз).\n\n"
     "Формат: пиши по-русски, тем же компактным форматом с эмодзи-нумерацией, как в исходнике. "
     "В начале 1-2 строки: что изменил, как прогрессируешь нагрузку и почему. Кратко и конкретно."
 )
 
 
-async def adapt_with_claude(base_workout, feeling, phase_name, hist_text, equip_text):
-    """Просим Claude адаптировать тренировку с учётом истории и оборудования."""
+async def adapt_with_claude(base_workout, feeling, phase_name, hist_text, equip_text, prof_text):
+    """Просим Claude адаптировать тренировку с учётом истории, оборудования и профиля."""
     if _claude_client is None:
         return None
     user_msg = (
         f"Фаза цикла: {phase_name}\n\n"
+        f"Профиль атлета: {prof_text}\n\n"
         f"Самочувствие атлета сегодня: {feeling}\n\n"
         f"Доступное оборудование зала:\n{equip_text}\n\n"
         f"История последних тренировок этой группы:\n{hist_text}\n\n"
-        f"Базовая тренировка (адаптируй, прогрессируй и подгони под оборудование):\n{base_workout}"
+        f"Базовая тренировка (адаптируй под профиль и самочувствие, прогрессируй и подгони под оборудование):\n{base_workout}"
     )
     try:
         resp = await _claude_client.messages.create(
@@ -560,7 +626,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🟢 Мягкий вход → 🟡 Объём → 🔴 Сила → по кругу.\n"
         f"{smart_line}\n"
         "Жми «✅ Выполнил» после тренировки — и группа перейдёт в следующую фазу.\n\n"
-        "🏋️ Команда /зал — настроить оборудование твоего зала (можно фоткой).\n\n"
+        "🏋️ Команда /зал — настроить оборудование твоего зала (можно фоткой).\n"
+        "🧑‍💼 Команда /profile — задать цель, стаж и частоту (тренировки точнее).\n\n"
         "Или выбери кнопкой ниже 👇"
     )
     await update.message.reply_text(text, reply_markup=main_keyboard(), parse_mode="Markdown")
@@ -593,6 +660,50 @@ async def gym_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 
+# ---------------------------------------------------------------------------
+#  Профиль атлета: команда и клавиатуры
+# ---------------------------------------------------------------------------
+def profile_goal_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💪 Масса", callback_data="pg:goal:mass")],
+        [InlineKeyboardButton("🏋️ Сила", callback_data="pg:goal:strength")],
+        [InlineKeyboardButton("🔥 Сушка / рельеф", callback_data="pg:goal:cut")],
+        [InlineKeyboardButton("🏃 Выносливость", callback_data="pg:goal:endurance")],
+        [InlineKeyboardButton("⚖️ Поддержание", callback_data="pg:goal:maintain")],
+    ])
+
+
+def profile_exp_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🟢 Новичок (<1 года)", callback_data="pg:exp:novice")],
+        [InlineKeyboardButton("🟡 Средний (1–3 года)", callback_data="pg:exp:inter")],
+        [InlineKeyboardButton("🔴 Опытный (3+ лет)", callback_data="pg:exp:adv")],
+    ])
+
+
+def profile_freq_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("2 в неделю", callback_data="pg:freq:2")],
+        [InlineKeyboardButton("3 в неделю", callback_data="pg:freq:3")],
+        [InlineKeyboardButton("4 в неделю", callback_data="pg:freq:4")],
+        [InlineKeyboardButton("5+ в неделю", callback_data="pg:freq:5")],
+    ])
+
+
+async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /profile — анкета атлета."""
+    uid = update.effective_user.id
+    cur = profile_text(uid)
+    cur_line = f"\n\n*Сейчас:* {cur}" if profile_complete(uid) else ""
+    await update.message.reply_text(
+        "🧑‍💼 *Профиль атлета*\n\n"
+        "Заполним 3 коротких пункта — тренировки станут прицельнее под твою цель.\n\n"
+        "*Шаг 1 из 3.* Какая у тебя цель?" + cur_line,
+        reply_markup=profile_goal_keyboard(),
+        parse_mode="Markdown",
+    )
+
+
 async def progress_text(user_id):
     lines = ["📊 *Твой прогресс по группам:*\n"]
     for g, data in WORKOUTS.items():
@@ -620,6 +731,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Слово «зал» (или /зал) запускает настройку оборудования
     if not context.user_data.get("awaiting_gym") and text_in.lower().lstrip("/") in ("зал", "оборудование"):
         await gym_command(update, context)
+        return
+
+    if not context.user_data.get("awaiting_gym") and text_in.lower().lstrip("/") in ("профиль", "profile", "анкета"):
+        await profile_command(update, context)
         return
 
     # Режим настройки зала текстом
@@ -758,7 +873,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("🤖 Подбираю тренировку под твоё самочувствие…")
         hist = history_text(uid, group)
         equip = equipment_text(uid)
-        adapted = await adapt_with_claude(base, feeling, PHASE_NAMES[phase], hist, equip)
+        prof = profile_text(uid)
+        adapted = await adapt_with_claude(base, feeling, PHASE_NAMES[phase], hist, equip, prof)
         if adapted:
             title = WORKOUTS[group]["title"]
             text = (
@@ -818,6 +934,27 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await progress_text(uid), reply_markup=main_keyboard(), parse_mode="Markdown"
         )
 
+    elif data.startswith("pg:"):
+        _, field, value = data.split(":", 2)
+        set_profile_field(uid, field, value)
+        if field == "goal":
+            await query.edit_message_text(
+                "🧑‍💼 *Профиль атлета*\n\n*Шаг 2 из 3.* Твой уровень/стаж?",
+                reply_markup=profile_exp_keyboard(), parse_mode="Markdown",
+            )
+        elif field == "exp":
+            await query.edit_message_text(
+                "🧑‍💼 *Профиль атлета*\n\n*Шаг 3 из 3.* Сколько тренировок в неделю?",
+                reply_markup=profile_freq_keyboard(), parse_mode="Markdown",
+            )
+        elif field == "freq":
+            await query.edit_message_text(
+                "✅ *Профиль сохранён!*\n\n" + profile_text(uid) +
+                "\n\nТеперь тренировки будут подбираться под твою цель. "
+                "Напиши группу мышц или жми кнопку 👇",
+                reply_markup=main_keyboard(), parse_mode="Markdown",
+            )
+
     elif data == "back_menu":
         await query.edit_message_text(
             "Выбери группу мышц 👇", reply_markup=main_keyboard()
@@ -838,6 +975,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("progress", lambda u, c: u.message.reply_text("Используй /start")))
     app.add_handler(CommandHandler("gym", gym_command))
+    app.add_handler(CommandHandler("profile", profile_command))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
